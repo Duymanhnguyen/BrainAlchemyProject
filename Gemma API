@@ -1,0 +1,82 @@
+#Brain Alchemy Project
+#Meta-analysis for Neuroinflammation in viral infection 
+#2 Aug 2022
+#Gemma API
+
+#############################################################
+
+#Download package
+install.packages("devtools")
+devtools::install_github("PavlidisLab/gemma.R")
+
+#Extract datasets from Gemma based on single search terms
+Sepsis = gemma.R::searchDatasets("Sepsis", limit = 100)
+Encephalitis = gemma.R::searchDatasets("Encephalitis", limit = 100)
+Viral_Encephalitis = gemma.R::searchDatasets("Viral Encephalitis", limit = 100)
+Neuroinflammation = gemma.R::searchDatasets("Neuroinflammation", limit = 100)
+Neuroimmune = gemma.R::searchDatasets("Neuroinmmune", limit = 100)
+Neuroimmunology = gemma.R::searchDatasets("Neuroinmmunology", limit = 100)
+Neurotoxicity = gemma.R::searchDatasets("Neurotoxicity", limit = 100)
+Neuroimmunity = gemma.R::searchDatasets("Neuroimmunity", limit = 100)
+Neuroinflame = gemma.R::searchDatasets("Neuroinflame", limit = 100)
+Neuroinflammatory = gemma.R::searchDatasets("Neuroinflammatory", limit = 100)
+Neurotropic = gemma.R::searchDatasets("Neurotropic", limit = 100)
+Neuroinvasive = gemma.R::searchDatasets("Neuroinvasive", limit = 100)
+Neurovirulence = gemma.R::searchDatasets("Neurovirulence", limit = 100)
+Viral = gemma.R::searchDatasets("Viral", limit = 100)
+Virus = gemma.R::searchDatasets("Virus", limit = 100)
+Infection = gemma.R::searchDatasets("Infection", limit = 100)
+Viral_Infection = gemma.R::searchDatasets("Viral Infection", limit = 100)
+Brain_Infection = gemma.R::searchDatasets("Brain Infection", limit = 100)
+Brain_Inflammation = gemma.R::searchDatasets("Brain Inflammation", limit = 100)
+Brain_Immunology = gemma.R::searchDatasets("Brain Immunology", limit = 100)
+Brain_Inflammatory = gemma.R::searchDatasets("Brain Inflammatory", limit = 100)
+
+#Extract datasets from Gemma based on specific viruses
+Zika = gemma.R::searchDatasets("Zika", limit = 100)
+Chikungunya = gemma.R::searchDatasets("Chikungunya", limit = 100)
+West_Nile = gemma.R::searchDatasets("West Nile", limit = 100)
+Japanese_encephalitis = gemma.R::searchDatasets("Japanese encephalitis", limit = 100)
+Venezuelan_encephalitis = gemma.R::searchDatasets("Venezuelan encephalitis", limit = 100)
+StLouis_encephalitis = gemma.R::searchDatasets("St Louis encephalitis", limit = 100)
+Polio = gemma.R::searchDatasets("Polio", limit = 100)
+Mumps = gemma.R::searchDatasets("Mumps", limit = 100)
+Measles = gemma.R::searchDatasets("Measles", limit = 100)
+Nipah = gemma.R::searchDatasets("Nipah", limit = 100)
+Hendra = gemma.R::searchDatasets("Hendra", limit = 100)
+Herpes = gemma.R::searchDatasets("Herpes", limit = 100)
+Varicella = gemma.R::searchDatasets("Varicella zoster", limit = 100)
+Epstein_Barr = gemma.R::searchDatasets("Epstein Barr", limit = 100)
+Cytomegalo = gemma.R::searchDatasets("Cytomegalovirus", limit = 100)
+Rabies = gemma.R::searchDatasets("Rabies", limit = 100)
+Influenza = gemma.R::searchDatasets("Influenza", limit = 100)
+Corona = gemma.R::searchDatasets("Coronavirus", limit = 100)
+Yellow_fever = gemma.R::searchDatasets("Yellow fever", limit = 100)
+
+#Extract the data to excel file
+install.packages("writexl")
+library("writexl")
+write_xlsx(Sepsis, "Sepsis.xlsx") 
+write_xlsx(Encephalitis,"Encephalitis.xlsx")
+write_xlsx(Viral_Encephalitis, "Viral Encephalitis.xlsx")
+write_xlsx(Neuroinflammation, "Neuroinflammation.xlsx")
+write_xlsx(Neuroimmunity,"Neuroimmunity.xlsx")
+write_xlsx(Neuroinflammatory,"Neuroinflammatory.xlsx")
+write_xlsx(Neurotoxicity,"Neurotoxicity.xlsx")
+write_xlsx(Neurotropic,"Neurotropic.xlsx")
+write_xlsx(Neuroinvasive, "Neuroinvasive.xlsx")
+write_xlsx(Neurovirulence, "Neurovirulence")
+write_xlsx(Viral, "Viral.xlsx")
+write_xlsx(Viral_Infection,"Viral Infection.xlsx")
+write_xlsx(Virus,"Virus.xlsx")
+write_xlsx(Infection, "Infection.xlsx")
+
+#Count the frequency of unique values in a dataframe
+table(Sepsis$taxon.Name) #Count based on the model (human, mouse, rat)
+
+#Combine and exclude datasets of other models than mouse/rat
+Total_datasets = rbind(Brain_Immunology, Brain_Infection, Brain_Inflammation, Corona, Cytomegalo, Encephalitis, Epstein_Barr, Hendra, Herpes, Infection,Influenza,Japanese_encephalitis, Measles, Neuroinflammation, Neuroinflammatory, Neuroinvasive, Neurotoxicity, Neurotropic, Neurovirulence, Rabies, Sepsis, Varicella, Venezuelan_encephalitis, Viral, Viral_Encephalitis, Viral_Infection, Virus, West_Nile, Yellow_fever, Zika)
+Total_datasets_eli_1 = subset(Total_datasets, Total_datasets$taxon.Name == "mouse")
+Total_datasets_eli_2 = subset(Total_datasets, Total_datasets$taxon.Name == "rat")
+Total_datasets_eli = unique(rbind(Total_datasets_eli_1, Total_datasets_eli_2))
+write_xlsx(Total_datasets_eli, "Total datasets.xlsx")
