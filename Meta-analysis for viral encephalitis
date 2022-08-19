@@ -1,0 +1,932 @@
+#Brain Alchemy Project
+#Meta-analysis for Neuroinflammation in viral infection 
+#2 Aug 2022
+#Streamlined meta-analysis code
+
+#############################################################
+
+install.packages("plyr")
+install.packages("metafor")
+install.packages("reshape")
+#Because "multtest" package is not available for the newer version of R, use the code below to download the package
+if (!require("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+BiocManager::install("multtest")
+
+library(plyr)
+library(metafor)
+library(reshape)
+library(multtest)
+
+#############################################################
+
+#1) Read in the differential expression results for each dataset
+
+#Set working directory to folder with differential expression result
+#Check if there are any abnormalities in the comment section of each file, both Analysis Results and Result Sets
+setwd("~/Desktop/Brain Alchemy/GSE30577_Rabies/5309_GSE30577_diffExpAnalysis_94169")
+list.files()
+
+#Function for reading in the result 
+ReadingInGemmaDE<-function(ResultSetFileNames){
+  #Read in the result file
+  TempAnalysisResults<-read.delim("analysis.results.txt", sep="\t", stringsAsFactors = FALSE, comment.char = "#")
+  #Transform into list format 
+  TempResultsToJoin<-list(TempAnalysisResults)
+  #Each differential expression file will contain multiple Result Set for each predictor variable
+  #Hence, we generalize the function with variable "i"
+  for(i in c(1:length(ResultSetFileNames))){
+    TempResultsToJoin[[i]]<-read.delim(ResultSetFileNames[i], sep="\t", stringsAsFactors = FALSE, comment.char = "#")
+  }
+  TempResultsJoined<<-join_all(TempResultsToJoin, by="Element_Name")
+  #Save and Print
+  write.csv(TempResultsJoined, "TempResultsJoined.csv")
+  rm(TempAnalysisResults, TempResultsToJoin)
+  print("Outputted object: TempResultsJoined")
+}
+
+#Example use of function
+ReadingInGemmaDE(ResultSetFileNames=c("resultset_ID478521.data.txt")) #GSE30577
+
+#############################################################
+
+#2) Match annotation files with result sets
+
+#Because there is no gene annotation for the Result set, we have to download it from the GEO Database 
+#Download the GPL7202-9760.txt from the GEO and put it in the folder of GSE30577_Rabies
+MoreAnnotation<-read.delim("GPL7202-9760.txt", sep="\t", header=TRUE, stringsAsFactors = FALSE, comment.char = "#")
+str(MoreAnnotation)
+#Check the name of the columns
+colnames(MoreAnnotation)
+#Pull out the Probe ID [1], the gene symbol [7], and the gene name [8] (Entrez and NCBI ID if available)
+#and concatenate into a smaller dataframe
+NeededAnnotation<-MoreAnnotation[,c(1,7:8)]
+#In order to join the annotation dataframe with the the result set dataframe, we need to make sure that they both share the 
+#similar probe ID/element name
+colnames(TempResultsJoined)
+#Rename the columns of NeededAnnotation for coherence
+colnames(NeededAnnotation)<-c("Element_Name", "Gene_Symbol_New","Gene_Name_New")
+#Join two dataframes by Element Names
+TempResultsJoined_wAnnotation<-join(TempResultsJoined, NeededAnnotation, by="Element_Name", type="left")
+str(TempResultsJoined_wAnnotation)
+
+TempResultsJoined_wAnnotation$Gene_Symbol<-TempResultsJoined_wAnnotation$Gene_Symbol_New
+TempResultsJoined_wAnnotation$Gene_Name<-TempResultsJoined_wAnnotation$Gene_Name_New
+#Overwrite the original TempResultsJoined with the TempResultsJoined_wAnnotation
+TempResultsJoined<-TempResultsJoined_wAnnotation
+
+#############################################################
+
+#3) Remove rows of data that have missing or unambiguous gene annotation
+
+#Because each probe might map to either more than one gene symbol or no gene symbol at all, we need to remove these observations (probes) out of our dataset
+
+#Function to remove probes that map to more than one gene or no gene 
+FilteringDEResults_GoodAnnotation<-function(TempResultsJoined){
+  
+  print("# of rows with missing NCBI annotation:")
+  print(sum(TempResultsJoined$NCBI_ID==""|TempResultsJoined$NCBI_ID=="null"))
+  
+  print("# of rows with missing Gene Symbol annotation:")
+  print(sum(TempResultsJoined$Gene_Symbol==""|TempResultsJoined$Gene_Symbol=="null"))
+  
+  print("# of rows mapped to multiple NCBI_IDs:")
+  print(length(grep('\\|', TempResultsJoined$NCBI_ID)))
+  
+  print("# of rows mapped to multiple Gene Symbols:")
+  print(length(grep('\\|', TempResultsJoined$Gene_Symbol)))
+  
+  #We only want the subset of data which contains rows that do not contain a Gene Symbol of ""
+  TempResultsJoined_NoNA<-TempResultsJoined[(TempResultsJoined$Gene_Symbol==""|TempResultsJoined$Gene_Symbol=="null")==FALSE,]
+  
+  if(length(grep('\\|', TempResultsJoined_NoNA$Gene_Symbol))==0){
+    TempResultsJoined_NoNA_NoMultimapped<<-TempResultsJoined_NoNA
+  }else{
+    #We only want rows annotated with a single Gene Symbol (no pipe)
+    TempResultsJoined_NoNA_NoMultimapped<<-TempResultsJoined_NoNA[-(grep('\\|', TempResultsJoined_NoNA$Gene_Symbol)),]
+  }
+  
+  print("# of rows with good annotation")
+  print(nrow(TempResultsJoined_NoNA_NoMultimapped))
+  
+  #For record keeping (sometimes useful for troubleshooting later)
+  write.csv(TempResultsJoined_NoNA_NoMultimapped, "TempResultsJoined_NoNA_NoMultimapped.csv")
+  
+  rm(TempResultsJoined_NoNA, TempResultsJoined_NoNA_NoMultimapped)
+  
+  print("Outputted object: TempResultsJoined_NoNA_NoMultimapped")
+}
+
+#Example use of the function
+FilteringDEResults_GoodAnnotation(TempResultsJoined)
+
+#############################################################
+
+#4) Identify the result sets for variables of interest, collapse the results (average) if there is more than one row of data per gene, and use F2C and Tstat to calculate standard error before using the standard error to calculate sample variance (standard error^2):
+
+#At this point, we should double-check:
+#A) Whether Gemma has used a reference (baseline) group that makes sense for our analysis 
+#B) Which group comparisons are actually of interest to us.
+
+#Function to collapse the result and identify the gene of interest
+CollapsingDEResults_OneResultPerGene<-function(GSE_ID, TempResultsJoined_NoNA_NoMultimapped, ComparisonsOfInterest, NamesOfFoldChangeColumns, NamesOfTstatColumns){
+  #Meaning of Parameters of the function
+  #GSE_ID is a string indicating the name of the Gemma dataset
+  #TempResultsJoined_NoNA_NoMultimapped is the data frame outputted by our previous function
+  #ComparisonsOfInterest is a character vector containing a list of group comparisons of interest within this dataset. 
+  #Important: These group comparisons should be listed in exactly the same order as the order that you provide the column names for their associated Fold Change and Tstat output.
+  #NamesOfFoldChangeColumns is a list containing the columns of TempResultsJoined_NoNA_NoMultimapped containing the FoldChange results for your comparisons of interest, in the same order as the ComparisonsOfInterest vector
+  #NamesOfTstatColumns is a list containing the columns of TempResultsJoined_NoNA_NoMultimapped containing the Tstat results for your comparisons of interest, in the same order as the ComparisonsOfInterest vector
+  
+  print("Double check that the vectors containing the two fold change and tstat column names contain the same order as the group comparisons of interest - otherwise this function won't work properly!  If the order matches, proceed:")
+  
+  print("# of rows with unique NCBI IDs:")
+  print(length(unique(TempResultsJoined_NoNA_NoMultimapped$NCBI_ID)))
+  
+  print("# of rows with unique Gene Symbols:")
+  print(length(unique(TempResultsJoined_NoNA_NoMultimapped$Gene_Symbol)))
+  
+  #We will need both the Log2FC and T-stats averaged across the result sets:
+  TempResultsJoined_NoNA_NoMultimapped_FoldChange_Average<-list()
+  for(i in c(1:length(NamesOfFoldChangeColumns))){
+    TempResultsJoined_NoNA_NoMultimapped_FoldChange_Average[[i]]<-tapply(NamesOfFoldChangeColumns[i][[1]], TempResultsJoined_NoNA_NoMultimapped$Gene_Symbol, mean)
+  }
+  TempResultsJoined_NoNA_NoMultimapped_FoldChange_AveragedByGeneSymbol<-do.call(cbind, TempResultsJoined_NoNA_NoMultimapped_FoldChange_Average)
+  
+  print("Dimensions of Fold Change matrix, averaged by gene symbol:")
+  print(dim(TempResultsJoined_NoNA_NoMultimapped_FoldChange_AveragedByGeneSymbol))
+  
+  colnames(TempResultsJoined_NoNA_NoMultimapped_FoldChange_AveragedByGeneSymbol)<-ComparisonsOfInterest
+  
+  write.csv(TempResultsJoined_NoNA_NoMultimapped_FoldChange_AveragedByGeneSymbol, "TempResultsJoined_NoNA_NoMultimapped_FoldChange_AveragedByGeneSymbol.csv")
+  
+  TempResultsJoined_NoNA_NoMultimapped_Tstat_Average<-list()
+  for(i in c(1:length(NamesOfFoldChangeColumns))){
+    TempResultsJoined_NoNA_NoMultimapped_Tstat_Average[[i]]<-tapply(NamesOfTstatColumns[i][[1]], TempResultsJoined_NoNA_NoMultimapped$Gene_Symbol, mean)
+  }
+  TempResultsJoined_NoNA_NoMultimapped_Tstat_AveragedByGeneSymbol<-do.call(cbind, TempResultsJoined_NoNA_NoMultimapped_Tstat_Average)
+  
+  colnames(TempResultsJoined_NoNA_NoMultimapped_Tstat_AveragedByGeneSymbol)<-ComparisonsOfInterest
+  
+  write.csv(TempResultsJoined_NoNA_NoMultimapped_Tstat_AveragedByGeneSymbol, "TempResultsJoined_NoNA_NoMultimapped_Tstat_AveragedByGeneSymbol.csv")
+  
+  TempResultsJoined_NoNA_NoMultimapped_SE<-list()
+  for(i in c(1:length(NamesOfFoldChangeColumns))){
+    TempResultsJoined_NoNA_NoMultimapped_SE[[i]]<-NamesOfFoldChangeColumns[i][[1]]/NamesOfTstatColumns[i][[1]]
+  }
+  
+  TempResultsJoined_NoNA_NoMultimapped_SE_Average<-list()
+  for(i in c(1:length(NamesOfFoldChangeColumns))){
+    TempResultsJoined_NoNA_NoMultimapped_SE_Average[[i]]<-tapply(TempResultsJoined_NoNA_NoMultimapped_SE[[i]], TempResultsJoined_NoNA_NoMultimapped$Gene_Symbol, mean)
+  }
+  TempResultsJoined_NoNA_NoMultimapped_SE_AveragedByGeneSymbol<-do.call(cbind, TempResultsJoined_NoNA_NoMultimapped_SE_Average)
+  
+  colnames(TempResultsJoined_NoNA_NoMultimapped_SE_AveragedByGeneSymbol)<-ComparisonsOfInterest
+  
+  write.csv(TempResultsJoined_NoNA_NoMultimapped_SE_AveragedByGeneSymbol, "TempResultsJoined_NoNA_NoMultimapped_SE_AveragedByGeneSymbol.csv")
+  
+  #For running our meta-analysis, we are actually going to need the sampling variance instead of the standard error
+  #The sampling variance is just the standard error squared.
+  
+  TempResultsJoined_NoNA_NoMultimapped_SV<-(TempResultsJoined_NoNA_NoMultimapped_SE_AveragedByGeneSymbol)^2
+  
+  write.csv(TempResultsJoined_NoNA_NoMultimapped_SV, "TempResultsJoined_NoNA_NoMultimapped_SV.csv")
+  
+  TempMasterResults<-list(Log2FC=TempResultsJoined_NoNA_NoMultimapped_FoldChange_AveragedByGeneSymbol, Tstat=TempResultsJoined_NoNA_NoMultimapped_Tstat_AveragedByGeneSymbol, SE=TempResultsJoined_NoNA_NoMultimapped_SE_AveragedByGeneSymbol, SV=TempResultsJoined_NoNA_NoMultimapped_SV)
+  
+  assign(paste("DEResults", GSE_ID, sep="_"), TempMasterResults, envir = as.environment(1))
+  
+  print(paste("Output: Named DEResults", GSE_ID, sep="_"))
+  
+  rm(TempMasterResults, TempResultsJoined_NoNA_NoMultimapped_SV, TempResultsJoined_NoNA_NoMultimapped_SE, TempResultsJoined_NoNA_NoMultimapped_FoldChange_AveragedByGeneSymbol, TempResultsJoined_NoNA_NoMultimapped_FoldChange_Average, TempResultsJoined_NoNA_NoMultimapped_Tstat_AveragedByGeneSymbol, TempResultsJoined_NoNA_NoMultimapped_Tstat_Average)
+  
+}
+
+#Example use of the function
+CollapsingDEResults_OneResultPerGene(GSE_ID="GSE30577", TempResultsJoined_NoNA_NoMultimapped, ComparisonsOfInterest=c("Rabies_infected_VS_Control"), NamesOfFoldChangeColumns=list(TempResultsJoined_NoNA_NoMultimapped$FoldChange_Rabies.virus_strain.CVS.11), NamesOfTstatColumns=list(TempResultsJoined_NoNA_NoMultimapped$Tstat_Rabies.virus_strain.CVS.11))   
+
+#############################################################
+
+#Clean up the environment for each run of the different GSE datasets
+rm(MoreAnnotation, NeededAnnotation, TempResultsJoined, TempResultsJoined_NoNA_NoMultimapped, TempResultsJoined_wAnnotation)
+
+#############################################################
+
+#5) Combine together the relevant results from different studies into a single data-frame for the effect sizes (Log2FC) and a single data.frame for the sampling variances.
+
+#Set working directory for meta-analysis
+setwd("~/Desktop/Brain Alchemy/Meta-Analysis")
+
+#The gene symbols are the row.names - 75% of gene symbols for rats and mice are the same, so for simplicity sake, instead of using a gene orthology database to inform equivalency, we're just going to align the datasets by gene symbol.
+
+AligningDatasets<-function(ListOfDEResults){
+  
+#Create a placeholder list  
+  MetaAnalysis_FoldChange_Dfs<-list()
+  
+#The Log2FC values are the first element in the differential expression result object for each study
+  for(i in c(1:length(ListOfDEResults))){
+    MetaAnalysis_FoldChange_Dfs[[i]]<-data.frame(x=row.names(ListOfDEResults[[i]][[1]]),ListOfDEResults[[i]][[1]], stringsAsFactors=FALSE)
+  }
+  
+  print("MetaAnalysis_FoldChange_Dfs:")
+  print(str(MetaAnalysis_FoldChange_Dfs))
+ 
+#This function could be join_all (if there are more than 2 datasets) or merge/merge_all (if the plyr package isn't working)
+  MetaAnalysis_FoldChanges<<-join_all(MetaAnalysis_FoldChange_Dfs, by="x", type="full")
+
+  print("MetaAnalysis_FoldChanges:")
+  print(str(MetaAnalysis_FoldChanges))
+  
+#Create a placeholder list  
+  MetaAnalysis_SV_Dfs<-list()
+  
+#The sampling variance values are the last (fourth) element in the differential expression result object for each study
+  for(i in c(1:length(ListOfDEResults))){
+    MetaAnalysis_SV_Dfs[[i]]<-data.frame(x=row.names(ListOfDEResults[[i]][[4]]),ListOfDEResults[[i]][[4]], stringsAsFactors=FALSE)
+  }
+  
+  print("MetaAnalysis_SV_Dfs:")
+  print(str(MetaAnalysis_SV_Dfs))
+  
+#This function could be join_all (if there are more than 2 datasets) or merge/merge_all (if the plyr package isn't working)
+  MetaAnalysis_SV<<-join_all(MetaAnalysis_SV_Dfs, by="x", type="full")
+
+  print("MetaAnalysis_SV:")
+  print(str(MetaAnalysis_SV))
+  
+  write.csv(MetaAnalysis_FoldChanges, "MetaAnalysis_FoldChanges.csv")
+  write.csv(MetaAnalysis_SV, "MetaAnalysis_SamplingVariances.csv")
+  
+  
+  rm(MetaAnalysis_SV_Dfs, MetaAnalysis_FoldChange_Dfs)
+}
+
+#Example use of the function
+ListOfDEResults<-list(DEResults_GSE30577, DEResults_GSE42264, DEResults_GSE44331, DEResults_GSE51365, DEResults_GSE53784, DEResults_GSE91074)
+AligningDatasets(ListOfDEResults)
+
+#Double check to see if the rows are in the same order after binding 
+sum(MetaAnalysis_FoldChanges$x==MetaAnalysis_SV$x)
+# [1] 27542
+
+sum(MetaAnalysis_FoldChanges$x!=MetaAnalysis_SV$x)
+# [1] 0
+
+#############################################################
+
+#6) Make a correlation matrix to compare the overall results from the different studies. Further visualize the comparison using a hierarchically-clustered heatmap of the correlation matrix.
+
+#We can generally compare the differential expression associated with different datasets or variable comparisons using a scatterplot and correlation analysis.
+#The code for making scatterplots is very similar to the boxplot code that we used earlier. It uses a y~x formula, and can include many of the same parameters (e.g., x and y labels, color)
+
+plot(MetaAnalysis_FoldChanges$WT_MHV68_infected_VS_Control ~ MetaAnalysis_FoldChanges$M_MHV68_infected_VS_Control, ylab="WT MHV68 Log2FC", xlab="M MHV68 Log2FC", main="Correlation analysis between Wild Type MHV68 and Latent MHV68")
+
+#Within this plot, each data point represents the differential expression results (log2FC) for a particular gene for two different comparisons within the same dataset (GSE51365): infected with mutant HNV68  vs. control (x-axis) and infected with wild type MHV68 vs. control (y axis)
+
+#From this plot, we can see that the Log2FC of the genes clustered within the -0.5 to 0.5 range for both WT and M HMV68. There seems to be a positive correlation between the two comparisons
+#If a gene shows a positive log2FC for the infected with WT vs. control comparison, it means that the WT group has greater log2 expression for that gene than the control group
+#If a gene shows a negative log2FC for the infected with WT vs. control comparison, it means that the WT group has smaller log2 expression for that gene than the control group
+#Similar explanation for M group
+
+#We use a linear regression model to calculate the intercept and slope for the linear relationship between the two variables using the y~x formula above
+Trendline<-lm(MetaAnalysis_FoldChanges$WT_MHV68_infected_VS_Control ~ MetaAnalysis_FoldChanges$M_MHV68_infected_VS_Control)
+#And then add that line to our scatterplot
+abline(Trendline, col=2, lwd=3)
+
+#If we want to know whether that linear relationship is stronger than we might expect due to random chance
+summary.lm(Trendline)
+
+# Call:
+#   lm(formula = MetaAnalysis_FoldChanges$WT_MHV68_infected_VS_Control ~ 
+#        MetaAnalysis_FoldChanges$M_MHV68_infected_VS_Control)
+# 
+# Residuals:
+#   Min       1Q   Median       3Q      Max 
+# -1.02214 -0.05243 -0.00230  0.04877  2.40660 
+# 
+# Coefficients:
+# Estimate Std. Error t value Pr(>|t|)    
+# (Intercept)                                          -0.0040705  0.0007266  -5.603 2.14e-08 ***
+# MetaAnalysis_FoldChanges$M_MHV68_infected_VS_Control  0.5454441  0.0069706  78.249  < 2e-16 ***
+#   ---
+#   Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
+# 
+# Residual standard error: 0.1072 on 21813 degrees of freedom
+# (5727 observations deleted due to missingness)
+# Multiple R-squared:  0.2192,	Adjusted R-squared:  0.2191 
+# F-statistic:  6123 on 1 and 21813 DF,  p-value: < 2.2e-16
+
+#The estimate for intercept is where the trend line crosses the y-axis
+#The estimate for "M_MHV68_infected_VS_Control" is the slope - how much of an increase in Log2FC you should expect in the "WT_MHV68_infected_VS_Control" if you see a one unit increase in Log2FC for "M_MHV68_infected_VS_Control" 
+#The Pr(>|t|) is the p-value for that relationship, in this case it is smaller than R is willing to display (<2e-16)
+
+#If we want to find the normalized correlation coefficient for this relationship (ranging between -1 to 1, with -1 being a perfect negative correlation and +1 being a perfect positive correlation), we can run a correlation analysis
+#While running this correlation analysis, we have to tell R to ignore any rows of differential expression output that don't have Log2FC for one of our variables (use "pairwise complete observations")
+cor(MetaAnalysis_FoldChanges$WT_MHV68_infected_VS_Control, MetaAnalysis_FoldChanges$M_MHV68_infected_VS_Control, use="pairwise.complete.obs")
+# [1] 0.4681648
+
+#We can run correlation analysis comparing Log2FC from every differential expression results in our meta-analysis
+#This is correlation matrix
+cor(as.matrix(MetaAnalysis_FoldChanges[,-1]), use="pairwise.complete.obs")
+
+#It is easier to see in Excel format
+write.csv(cor(as.matrix(MetaAnalysis_FoldChanges[,-1]), use="pairwise.complete.obs"), "CorMatrix_WholeBrain_ViralInfection_Log2FC.csv")
+
+#In the output, each cell includes the correlation coefficient reflecting the similarity of the effects for the variable in the row and column.  
+#The intersection of a variable with itself creates a coefficient of 1 (i.e., identical)
+#Comparisons from the same datasets tend to have higher and positive correlation coefficient 
+
+#We can also visualize that correlation matrix using a hierarchically-clustered heatmap:
+heatmap(cor(as.matrix(MetaAnalysis_FoldChanges[,-1]), use="pairwise.complete.obs"), main = "Hierarchially-clustered heatmap for different viral infections with neuro-virulence")
+#In this heatmap, white/yellow indicates a more positive correlation
+#The groups are placed in order by similarity, as determined by hierarchical clustering.
+#The lines ("tree branches") on the left and top illustrate that similarity (clustering) using a "dendrogram"
+
+#Personalize the heatmap using "gplots" package. Because the "gplots" package is not available for the newer version of R, use the code below to download the package 
+if (!require("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+BiocManager::install("gplots")
+
+library(gplots)
+heatmap.2(cor(as.matrix(MetaAnalysis_FoldChanges[,-1]), use="pairwise.complete.obs"), cexRow = 0.8, cexCol = 0.75, margins = c(12,12), sepwidth = c(0.025, 0.025), trace ="none", key = TRUE, keysize = 1, key.title = "Color Key", density.info = "none")
+
+#Save as png format with quartz window 
+png("rplot.png", width = 400, height = 400)
+heatmap.2(cor(as.matrix(MetaAnalysis_FoldChanges[,-1]), use="pairwise.complete.obs"), cexRow = 0.8, cexCol = 0.75, margins = c(12,12), sepwidth = c(0.025, 0.025), trace ="none", key = TRUE, keysize = 1, key.title = "Color Key", density.info = "none")
+dev.off()
+
+#############################################################
+
+#8) Run a meta-analysis using all of the effect sizes for each gene that has data from at least 2 studies. 
+
+#We can only run a meta-analysis if there are differential expression results from more than one comparison.
+#Since we know that the differential expression results from the same study (datasets) are artificially correlated, we would actually prefer that there are results from more than one dataset.
+
+#This code calculates the number of NAs in each row
+MetaAnalysis_FoldChanges_NAsPerRow<-apply(MetaAnalysis_FoldChanges, 1, function(y) sum(is.na(y)))
+
+#Visualize the NAs
+
+#Using histogram
+hist(MetaAnalysis_FoldChanges_NAsPerRow)
+
+#Using table
+table(MetaAnalysis_FoldChanges_NAsPerRow)
+# MetaAnalysis_FoldChanges_NAsPerRow
+# 0    1    2    3    4    5    6    7 
+# 6120 7332 3008 1858 3494  437 3829 1464 
+
+#This table tells us how many genes (rows) contain each number of NAs 
+#Ex: There are 6120 genes that contain no NA, meaning that these 6120 genes can be found across all datasets
+#Ex: There are 7332 genes that contain 1 NA in 1 of the 8 datasets
+
+RunBasicMetaAnalysis<-function(NumberOfComparisons, CutOffForNAs, MetaAnalysis_FoldChanges, MetaAnalysis_SV){
+  
+  MetaAnalysis_FoldChanges_NAsPerRow<-apply(MetaAnalysis_FoldChanges, 1, function(y) sum(is.na(y)))
+  
+  print("Table of # of NAs per Row (Gene):")
+  print(table(MetaAnalysis_FoldChanges_NAsPerRow))
+  
+  MetaAnalysis_FoldChanges_ForMeta<<-MetaAnalysis_FoldChanges[MetaAnalysis_FoldChanges_NAsPerRow<CutOffForNAs,]
+  MetaAnalysis_SV_ForMeta<<-MetaAnalysis_SV[MetaAnalysis_FoldChanges_NAsPerRow<CutOffForNAs,]
+  
+  print("MetaAnalysis_FoldChanges_ForMeta:")
+  print(str(MetaAnalysis_FoldChanges_ForMeta))
+  
+  #Make an empty matrix to store the results of my meta-analysis
+  metaOutput<-matrix(NA, length(MetaAnalysis_FoldChanges_ForMeta$x), 6)
+  
+  #Run a loop that run a meta-analysis on the differential expression results (columns 2-10) for each gene (row)
+  for(i in c(1:length(MetaAnalysis_FoldChanges_ForMeta$x))){
+    
+    effect<-as.numeric(MetaAnalysis_FoldChanges_ForMeta[i,-1])
+    var<-as.numeric(MetaAnalysis_SV_ForMeta[i,-1])
+    
+    #I added a function tryCatch that double-checks that the meta-analysis function (rma) doesn't produce errors (which breaks the loop):
+    skip_to_next <- FALSE
+    tryCatch(TempMeta<-rma(effect, var), error = function(e) {skip_to_next <<- TRUE})
+    
+    if(skip_to_next){}else{
+      TempMeta<-rma(effect, var)
+      metaOutput[i, 1]<-TempMeta$b #gives estimate Log2FC
+      metaOutput[i, 2]<-TempMeta$se #gives standard error
+      metaOutput[i, 3]<-TempMeta$pval #gives pval
+      metaOutput[i, 4]<-TempMeta$ci.lb #gives confidence interval lower bound
+      metaOutput[i, 5]<-TempMeta$ci.ub #gives confidence interval upper bound
+      metaOutput[i, 6]<-NumberOfComparisons-sum(is.na(effect))#Number of comparisons with data
+      rm(TempMeta)
+    }
+    rm(effect, var)
+  }
+  
+  colnames(metaOutput)<-c("Log2FC_estimate", "SE", "pval", "CI_lb", "CI_ub", "Number_Of_Comparisons")
+  row.names(metaOutput)<-MetaAnalysis_FoldChanges_ForMeta$x
+  
+  metaOutput<<-metaOutput
+  return(metaOutput)
+  
+  print("metaOutput:")
+  print(str(metaOutput))
+  
+  print("Top of metaOutput:")
+  print(head(metaOutput))
+  
+  print("Bottom of metaOutput")
+  print(tail(metaOutput))
+}
+
+#Example use of the function
+NumberOfComparisons = 8
+CutOffForNAs = 2
+metaOutput<-RunBasicMetaAnalysis(NumberOfComparisons, CutOffForNAs, MetaAnalysis_FoldChanges, MetaAnalysis_SV)
+
+# [1] "Table of # of NAs per Row (Gene):"
+# MetaAnalysis_FoldChanges_NAsPerRow
+# 0    1    2    3    4    5    6    7 
+# 6120 7332 3008 1858 3494  437 3829 1464 
+# [1] "MetaAnalysis_FoldChanges_ForMeta:"
+# 'data.frame':	13452 obs. of  9 variables:
+# $ x                           : chr  "0610030E20Rik" "0610039K10Rik" "0610040B10Rik" "1110004F10Rik" ...
+# $ Rabies_infected_VS_Control  : num  -1.0995 -0.0319 1.443 1.434 -1.179 ...
+# $ Measles_infected_VS_Control : num  0.00966 -0.08449 -0.05378 -0.1392 0.08683 ...
+# $ VSV_infected_VS_Control     : num  -0.0399 0.1086 -0.1251 0.1405 0.0305 ...
+# $ WT_MHV68_infected_VS_Control: num  0.0858 0.0612 0.0962 0.0544 -0.0829 ...
+# $ M_MHV68_infected_VS_Control : num  0.0339 0.1126 0.0782 0.1448 -0.0377 ...
+# $ JEV_infected_VS_Control     : num  -0.114 0.156 -0.466 0.38 -0.169 ...
+# $ WNV_infected_VS_Control     : num  0.2198 -0.0547 0.00992 0.4089 -0.324 ...
+# $ VEEV_infected_VS_Control    : num  NA NA NA -0.0981 -0.4617 ...
+# NULL
+
+str(metaOutput)
+# num [1:13452, 1:6] 0.0233 0.0324 -0.064 0.1252 -0.1394 ...
+# - attr(*, "dimnames")=List of 2
+# ..$ : chr [1:13452] "0610030E20Rik" "0610039K10Rik" "0610040B10Rik" "1110004F10Rik" ...
+# ..$ : chr [1:6] "Log2FC_estimate" "SE" "pval" "CI_lb" ...
+
+head(metaOutput)
+#                    Log2FC_estimate          SE       pval       CI_lb      CI_ub  Number_Of_Comparisons
+# 0610030E20Rik      0.02334857       0.04693926 0.61889221 -0.06865069 0.11534783                     7
+# 0610039K10Rik      0.03242756       0.04844713 0.50327923 -0.06252708 0.12738219                     7
+# 0610040B10Rik     -0.06403339       0.08032693 0.42535829 -0.22147128 0.09340450                     7
+# 1110004F10Rik      0.12524571       0.08715687 0.15071379 -0.04557862 0.29607004                     8
+# 1110032A03Rik     -0.13939802       0.07867058 0.07640772 -0.29358952 0.01479347                     8
+# 1110038F14Rik      0.25487988       0.12944737 0.04895486  0.00116769 0.50859206                     8
+
+tail(metaOutput)
+#             Log2FC_estimate         SE       pval       CI_lb       CI_ub Number_Of_Comparisons
+# Zswim1      0.02557167      0.05485372 0.64108720 -0.08193965  0.13308298                     7
+# Zswim6      0.02488967      0.09050350 0.78330602 -0.15249394  0.20227327                     7
+# Zswim7      0.06434080      0.06165679 0.29670222 -0.05650429  0.18518588                     7
+# Zw10       -0.06807612      0.02873557 0.01783366 -0.12439681 -0.01175543                     7
+# Zxdc        0.03448134      0.08031938 0.66770286 -0.12294175  0.19190442                     7
+# Zyg11b     -0.22091469      0.10358436 0.03294909 -0.42393630 -0.01789307                     7
+
+#############################################################
+
+## Multiple Comparison corrections
+#The following code applies two different types of multiple-comparison corrections to the raw p-values (Benjamini-Hochberg and Benjamini-Yekutieli) 
+#Meta-analysis output with adjusted p-values is then outputted along with effect size information.
+
+#9) Correct the meta-analysis output to take into account the fact that we are running the statistical calculations many times and therefore have a heightened risk of false discovery (false discovery rate correction) 
+
+colnames(metaOutput)
+# [1] "Log2FC_estimate"       "SE"                    "pval"                  "CI_lb"                 "CI_ub"                
+# [6] "Number_Of_Comparisons"                "Number_Of_Comparisons"
+#The p-values are in column 3
+
+#We use the column with pvalues to run a multiple comparisons correction using the Benjamini-Hochberg method ("FDR" or "q-value")
+tempPvalAdjMeta<-mt.rawp2adjp(metaOutput[,3], proc=c("BH"))
+
+#Unfortunately, the output from that function re-orders the FDR-corrected p-values in order of "significance"
+#We want the FDR-corrected p-values to be in the their original order (the order of the rest of our statistical output!). This order is recorded in the index (row numbers) for the p-values
+metaPvalAdj<-tempPvalAdjMeta$adjp[order(tempPvalAdjMeta$index),]
+
+#We can double-check that they are in the same order by comparing the uncorrected p-values in the metaPvalAdj object to the pvalues in the metaOutput matrix
+plot(metaPvalAdj[,1] ~ metaOutput[,3])
+#We can see a straight line, meaning that they are basically in the same order
+
+#Adjusted pvalue object is in same orientation as metaOutput so they can simply be binded together
+metaOutputFDR<-cbind(metaOutput, metaPvalAdj[,2])
+
+str(metaOutputFDR)
+# num [1:13452, 1:7] 0.0233 0.0324 -0.064 0.1252 -0.1394 ...
+# - attr(*, "dimnames")=List of 2
+# ..$ : chr [1:13452] "0610030E20Rik" "0610039K10Rik" "0610040B10Rik" "1110004F10Rik" ...
+# ..$ : chr [1:7] "Log2FC_estimate" "SE" "pval" "CI_lb" ...
+
+#Functionalize this process
+FalseDiscoveryCorrection<-function(metaOutput){
+  
+  tempPvalAdjMeta<-mt.rawp2adjp(metaOutput[,3], proc=c("BH"))
+  
+  metaPvalAdj<-tempPvalAdjMeta$adjp[order(tempPvalAdjMeta$index),]
+  
+  metaOutputFDR<-cbind(metaOutput, metaPvalAdj[,2])
+  
+  colnames(metaOutputFDR)[7]<-"FDR"
+  
+  metaOutputFDR<<-metaOutputFDR
+  
+  print("metaOutputFDR:")
+  print(str(metaOutputFDR))
+  
+  write.csv(metaOutputFDR, "metaOutputFDR.csv")
+  
+#Create a new output in order by p-value:
+  metaOutputFDR_OrderbyPval<<-metaOutputFDR[order(metaOutputFDR[,3]),]
+  
+#Export that output in the format of Excel
+  write.csv(metaOutputFDR_OrderbyPval, "metaOutputFDR_orderedByPval_wHDRFData.csv")
+  
+  print("Do we have any genes that are statistically significant following false discovery rate correction?")
+  print(sum(metaOutputFDR[,7]<0.10, na.rm=TRUE))
+  
+  print("What are the top results?")
+  print(head(metaOutputFDR[order(metaOutputFDR[,3]),]))
+  
+  rm(tempPvalAdjMeta, metaPvalAdj)
+}
+
+#Example use of the function
+FalseDiscoveryCorrection(metaOutput)
+# [1] "metaOutputFDR:"
+# num [1:13452, 1:7] 0.0233 0.0324 -0.064 0.1252 -0.1394 ...
+# - attr(*, "dimnames")=List of 2
+# ..$ : chr [1:13452] "0610030E20Rik" "0610039K10Rik" "0610040B10Rik" "1110004F10Rik" ...
+# ..$ : chr [1:7] "Log2FC_estimate" "SE" "pval" "CI_lb" ...
+# NULL
+# [1] "Do we have any genes that are statistically significant following false discovery rate correction?"
+# [1] 1730
+# [1] "What are the top results?"
+# Log2FC_estimate         SE         pval      CI_lb      CI_ub Number_Of_Comparisons          FDR
+# Doc2g        -0.3368003 0.03065747 4.466982e-28 -0.3968879 -0.2767128                     7 6.008984e-24
+# Hmgcs2       -0.2996615 0.02816082 1.918957e-26 -0.3548557 -0.2444673                     7 1.290691e-22
+# Ptov1        -0.2202169 0.02350228 7.251849e-21 -0.2662805 -0.1741533                     7 3.251729e-17
+# Msi1         -0.2819023 0.03051047 2.475902e-20 -0.3417017 -0.2221029                     7 8.326458e-17
+# Lhx9         -0.2312872 0.02667349 4.281436e-18 -0.2835663 -0.1790082                     8 1.151878e-14
+# Tmem121      -0.1926168 0.02241820 8.548062e-18 -0.2365557 -0.1486779                     7 1.916476e-14
+
+#############################################################
+
+#10) Determine which are the top differentially expressed genes and create forest plots to visualize the effect sizes for those top differentially expressed genes across the different studies 
+
+row.names(metaOutputFDR_OrderbyPval)[c(1:100)]
+# [1] "Doc2g"    "Hmgcs2"   "Ptov1"    "Msi1"     "Lhx9"     "Tmem121"  "Mbnl1"    "Mtss1"    "Ly6h"     "Gnas"    
+# [11] "Cdhr1"    "Fryl"     "Gstm6"    "Ryr1"     "H2-Oa"    "Gli1"     "Cap1"     "Nlrc5"    "Elp3"     "Kmt2c"   
+# [21] "Siva1"    "Pea15a"   "Fxn"      "Card6"    "Racgap1"  "Serpinb8" "Cox15"    "Bptf"     "Ubxn8"    "Tigd3"   
+# [31] "Coa7"     "Tmem71"   "Natd1"    "Mark4"    "Gsx1"     "Rtbdn"    "Lrfn1"    "Gigyf1"   "Fam20c"   "Pld2"    
+# [41] "Zfp14"    "Slc39a2"  "Chrac1"   "Btk"      "Med25"    "Dennd4a"  "Cbx1"     "Ptger4"   "Slc22a29" "Akt1"    
+# [51] "Desi2"    "Kbtbd4"   "Phldb1"   "Basp1"    "Rab11b"   "Prpsap1"  "Sf3b2"    "Ano1"     "Gtf2h3"   "Fli1"    
+# [61] "Anapc2"   "Dvl2"     "Irx6"     "Sumf1"    "Exoc4"    "Nmb"      "Bola1"    "Hsp90b1"  "Pias2"    "Tufm"    
+# [71] "Mageb3"   "Nck2"     "Gpr27"    "Scap"     "Six3"     "Tmem159"  "Fzd9"     "Zfp358"   "Dnajc3"   "Vps25"   
+# [81] "Limk2"    "Gigyf2"   "Rasa1"    "Mycn"     "Gbp3"     "Ipo7"     "Art3"     "Mkrn3"    "Ptpn5"    "Emilin1" 
+# [91] "Mrpl34"   "Srp9"     "Nf1"      "Cyp2r1"   "Pik3ip1"  "Pwp2"     "Smr3a"    "Map6"     "Arx"      "
+
+#Check the range of Log2FC values to figure out the limits of x-axis for forest plots
+hist(metaOutputFDR[,1], breaks=40)
+#Most values are between -1 and 1
+
+#Function for forest plots
+MakeForestPlots<-function(GeneSymbol){
+  
+  pdf(paste("ForestPlot_", GeneSymbol, ".pdf", sep=""), height=5, width=8)
+  
+  effect<-as.numeric(MetaAnalysis_FoldChanges_ForMeta[MetaAnalysis_FoldChanges_ForMeta$x==GeneSymbol,-1])
+  var<-as.numeric(MetaAnalysis_SV_ForMeta[MetaAnalysis_FoldChanges_ForMeta$x==GeneSymbol,-1])
+  
+  forest.rma(rma(effect, var),slab=colnames(MetaAnalysis_FoldChanges_ForMeta)[-1],  xlim=c(-3, 3))
+  
+  mtext(paste(GeneSymbol), line=-1.5, cex=2)
+  dev.off()
+}
+
+#Example use of the function
+MakeForestPlots("Doc2g")
+MakeForestPlots("Hmgcs2")
+MakeForestPlots("Ptov1")
+MakeForestPlots("Msi1")
+MakeForestPlots("Lhx9")
+MakeForestPlots("Tmem121")
+MakeForestPlots("Mbnl1")
+MakeForestPlots("Mtss1")
+MakeForestPlots("Ly6h")
+MakeForestPlots("Gnas")
+MakeForestPlots("Cdhr1")
+MakeForestPlots("Fryl")
+MakeForestPlots("Gstm6")
+MakeForestPlots("Ryr1")
+MakeForestPlots("H2-Oa")
+MakeForestPlots("Gli1")
+
+#Summary of the Log2FC distribution
+summary(metaOutputFDR[,1])
+# Min.      1st Qu.   Median     Mean  3rd Qu.     Max.     NA's 
+# -0.78886 -0.09537 -0.01162  0.05485  0.07955  4.13780       24 
+
+#The number of genes that are both statistically significant (using a more conservative FDR) and have a larger estimated Log2FC (>0.10 or <-0.10)
+sum(metaOutputFDR[,7]<0.05 & abs(metaOutputFDR[,1])>0.1, na.rm=TRUE)
+# [1] 865
+
+#Gene symbols for these genes
+row.names(metaOutputFDR_OrderbyPval)[metaOutputFDR_OrderbyPval[,7]<0.05 & abs(metaOutputFDR_OrderbyPval[,1])>0.1 & is.na(metaOutputFDR_OrderbyPval[,1])==FALSE]
+# [1] "Doc2g"         "Hmgcs2"        "Ptov1"         "Msi1"          "Lhx9"          "Tmem121"       "Mbnl1"        
+# [8] "Mtss1"         "Ly6h"          "Gnas"          "Cdhr1"         "Fryl"          "Gstm6"         "Ryr1"         
+# [15] "H2-Oa"         "Gli1"          "Cap1"          "Nlrc5"         "Elp3"          "Kmt2c"         "Siva1"        
+# [22] "Fxn"           "Card6"         "Racgap1"       "Serpinb8"      "Cox15"         "Bptf"          "Ubxn8"        
+# [29] "Tigd3"         "Coa7"          "Tmem71"        "Natd1"         "Mark4"         "Gsx1"          "Rtbdn"        
+# [36] "Lrfn1"         "Gigyf1"        "Fam20c"        "Pld2"          "Zfp14"         "Slc39a2"       "Btk"          
+# [43] "Med25"         "Dennd4a"       "Cbx1"          "Ptger4"        "Slc22a29"      "Akt1"          "Desi2"        
+# [50] "Kbtbd4"        "Phldb1"        "Rab11b"        "Prpsap1"       "Ano1"          "Fli1"          "Anapc2"       
+# [57] "Dvl2"          "Irx6"          "Sumf1"         "Exoc4"         "Nmb"           "Bola1"         "Hsp90b1"      
+# [64] "Tufm"          "Mageb3"        "Nck2"          "Gpr27"         "Scap"          "Six3"          "Tmem159"      
+# [71] "Fzd9"          "Zfp358"        "Dnajc3"        "Vps25"         "Limk2"         "Gigyf2"        "Rasa1"        
+# [78] "Mycn"          "Gbp3"          "Ipo7"          "Art3"          "Mkrn3"         "Ptpn5"         "Emilin1"      
+# [85] "Mrpl34"        "Srp9"          "Nf1"           "Cyp2r1"        "Pik3ip1"       "Pwp2"          "Smr3a"        
+# [92] "Map6"          "Arx"           "Cdh4"          "Spr"           "Adam17"        "Il6st"         "Ms4a4d"       
+# [99] "Cc2d1a"        "Rad21"         "Tspan10"       "Cib1"          "Scnn1a"        "Gbp2"          "Ppp1r12a"     
+# [106] "Spag4"         "Chmp7"         "Gm4951"        "Jag2"          "Prdx6"         "Cacna1h"       "Oma1"         
+# [113] "Gbp7"          "Tmem258"       "Ascl1"         "Cd164"         "Rpia"          "Tyw1"          "Uap1l1"       
+# [120] "Usp43"         "Stap1"         "Dclre1c"       "Cxcl10"        "Hs3st3a1"      "Irgm1"         "Krt4"         
+# [127] "Ccl5"          "Vash1"         "Rin2"          "Ankrd6"        "Wbp1"          "Kat2b"         "Ccdc65"       
+# [134] "Atp10a"        "Sox14"         "Cd52"          "Tspan18"       "Bst2"          "Slc39a6"       "Iigp1"        
+# [141] "Pou3f3"        "Ulk1"          "Xdh"           "Plac8"         "Gpaa1"         "Rdm1"          "AW112010"     
+# [148] "Bod1l"         "F9"            "Ephb2"         "Ifit1"         "Dctpp1"        "Chrnb1"        "Rbm28"        
+# [155] "Oxsr1"         "Col15a1"       "Tspan4"        "Frat1"         "Mvd"           "Ccl12"         "Ltc4s"        
+# [162] "Mutyh"         "Cela1"         "3110009E18Rik" "Clcn6"         "Psmb9"         "Usp18"         "Stat1"        
+# [169] "Cyb5a"         "Syap1"         "Ftsj1"         "Ube2w"         "Isg20"         "Dennd4c"       "Pou5f2"       
+# [176] "Arhgef28"      "Scrn2"         "Otp"           "Card10"        "Ins1"          "Rsad2"         "Trim30a"      
+# [183] "Ehmt2"         "Vopp1"         "Ehd3"          "Myl1"          "Cc2d1b"        "Anln"          "Ctbp2"        
+# [190] "Irak4"         "Srrm3"         "Nphp3"         "Nkg7"          "Mbtd1"         "Cd274"         "Oasl2"        
+# [197] "Stc1"          "Khdrbs2"       "Zfp423"        "Hk2"           "Gzmb"          "Btrc"          "Fbf1"         
+# [204] "Mvb12b"        "Bcl9l"         "Fgd1"          "Tm6sf2"        "Fam181b"       "Stac"          "Ms4a4b"       
+# [211] "Setdb1"        "Clec14a"       "Ifitm3"        "Tbc1d19"       "Kmo"           "Sox21"         "Baz2b"        
+# [218] "Hras"          "Ankra2"        "Tbk1"          "Ch25h"         "Fgl2"          "Ltb"           "Mien1"        
+# [225] "Efs"           "Ly86"          "Sftpa1"        "Oas1a"         "Btla"          "Abhd14a"       "Ms4a4c"       
+# [232] "Sbk1"          "Zdhhc9"        "Nup85"         "Prkci"         "Impdh1"        "Sall2"         "Dlx2"         
+# [239] "Ybx2"          "Ccdc59"        "Fcgr4"         "Unc13b"        "Cxcl9"         "Pigyl"         "Gbe1"         
+# [246] "Cbwd1"         "Vmn1r58"       "Ncf4"          "Arl8a"         "Adcy6"         "Ap2a2"         "Pou3f4"       
+# [253] "Hes5"          "Sema3f"        "Arhgap15"      "Esyt3"         "Dyrk1b"        "Ddah2"         "H2-Aa"        
+# [260] "Rtn4"          "Lgals3bp"      "Diras1"        "B2m"           "Efna2"         "Csdc2"         "Rnf115"       
+# [267] "Ifih1"         "Eomes"         "Crmp1"         "Romo1"         "Mob1a"         "Comp"          "Nr2f6"        
+# [274] "Pafah2"        "Dlx1as"        "Rasgef1c"      "Gzma"          "Slfn4"         "Dlk2"          "Igf1"         
+# [281] "Parp9"         "Epsti1"        "Sh3pxd2a"      "Clec5a"        "Sag"           "Src"           "Col11a1"      
+# [288] "Ifi44"         "Cyhr1"         "Oasl1"         "Sae1"          "Lsm11"         "Trrap"         "Nsun4"        
+# [295] "Ncoa6"         "Cnot6"         "Oca2"          "Arhgap35"      "Tmem131"       "Ppdpf"         "Gimap4"       
+# [302] "Zbp1"          "Slc26a1"       "Ptprs"         "Vangl1"        "Fcnb"          "H2-T24"        "Usp29"        
+# [309] "Cybb"          "Sgk3"          "Icam1"         "Rfc1"          "Nabp1"         "Ahsa2"         "Samsn1"       
+# [316] "Oas2"          "Csf2rb"        "Slit1"         "Jup"           "Trim30d"       "Mllt11"        "Clnk"         
+# [323] "Cables2"       "Itga4"         "Dgcr8"         "Sh3rf1"        "Scara5"        "Sppl3"         "Adcy4"        
+# [330] "Fyb"           "Coprs"         "Ifit2"         "Mx1"           "Efcc1"         "Gbp8"          "Atp5e"        
+# [337] "Dvl3"          "Arvcf"         "Rfng"          "Cacng4"        "Ngdn"          "Rtp4"          "Dusp18"       
+# [344] "D030056L22Rik" "Suds3"         "Cenpv"         "Cuedc2"        "Fah"           "H2-K1"         "Cdca7"        
+# [351] "Kank3"         "Kank2"         "Ly6a"          "Parp14"        "Il2rg"         "Ttl"           "Cmtr2"        
+# [358] "Dnmt1"         "Slfn8"         "Ifi35"         "Il18r1"        "Map3k8"        "Kcnip1"        "Fhod1"        
+# [365] "Irf1"          "Ms4a6b"        "Sdad1"         "Lrrc56"        "Myo10"         "Pdcd1lg2"      "Nt5c3b"       
+# [372] "Tnnc2"         "Dpy30"         "Pla2g4a"       "Mthfd1l"       "Lgals9"        "Sobp"          "Tomm34"       
+# [379] "Foxc1"         "Exoc7"         "Pgm5"          "Nxph4"         "Pard3"         "Sp100"         "Cenpc1"       
+# [386] "Mageh1"        "Ap3s2"         "Psmb8"         "Birc2"         "Bean1"         "Pde6d"         "Cd74"         
+# [393] "Nrros"         "Snx27"         "Sox7"          "Spire1"        "Cd3d"          "Irf7"          "Irf8"         
+# [400] "Ddx60"         "Prtn3"         "Lrp8"          "Ccdc117"       "Slc15a3"       "Fam169b"       "Pcyt2"        
+# [407] "Cst7"          "Phc1"          "Cntln"         "Dlx6"          "Ccar2"         "Slc2a4"        "Itgam"        
+# [414] "Eif2ak2"       "Nin"           "Cd209b"        "Lta4h"         "Mgp"           "Rab34"         "Neto2"        
+# [421] "Katnb1"        "Parp12"        "Cd37"          "Cd300a"        "Tnfsf10"       "C730034F03Rik" "Ptpn6"        
+# [428] "Fcrls"         "Gpr153"        "Spast"         "Tenm2"         "Hcls1"         "Kcnn1"         "Socs3"        
+# [435] "Unc5cl"        "Efnb3"         "Prm3"          "Ppp2r2b"       "Wiz"           "Tgfbi"         "Cd72"         
+# [442] "Cacna1b"       "Kmt2d"         "Sclt1"         "Lyz2"          "Zmiz2"         "Irf9"          "Hebp2"        
+# [449] "H2-Ab1"        "Tmem120b"      "Lrg1"          "Cfdp1"         "Zfp467"        "Kcns1"         "Fbxl15"       
+# [456] "Npepps"        "Grin2d"        "Smpd2"         "Nqo1"          "Rangrf"        "Col12a1"       "Mbd2"         
+# [463] "Ttc4"          "Apobec1"       "Fcgr1"         "Ctnnbip1"      "Fmo1"          "Chfr"          "Arl10"        
+# [470] "Pknox1"        "Hunk"          "C3"            "Exoc6b"        "Ccl2"          "Angpt1"        "Tmed5"        
+# [477] "Tap2"          "Fstl1"         "Mast1"         "Lrp1"          "Fcer1g"        "Ccl7"          "Il17rd"       
+# [484] "Hdlbp"         "Ms4a6d"        "Nyx"           "Wnt6"          "Lsm14b"        "Rhoa"          "Ubd"          
+# [491] "Cd2ap"         "Limd1"         "Ifitm1"        "Mpeg1"         "Lztr1"         "Nr1h2"         "Gch1"         
+# [498] "Ing1"          "Utp3"          "Csf2rb2"       "Nadsyn1"       "Scx"           "Tsen34"        "Col9a2"       
+# [505] "Sox12"         "Slc22a3"       "D2hgdh"        "Cep131"        "Tspo"          "Lef1"          "S100a3"       
+# [512] "Cul7"          "Wipf1"         "Cspp1"         "Mvk"           "Pcbp4"         "Ctsc"          "Samd9l"       
+# [519] "Nos3"          "Tor3a"         "Helz"          "Slfn2"         "Zbtb20"        "Irs1"          "Apol6"        
+# [526] "Nfe2l2"        "Slc6a6"        "Casp4"         "Slc12a4"       "Morn4"         "Ifng"          "Pon3"         
+# [533] "Usp3"          "Snx21"         "Cdc42ep2"      "Plce1"         "Casp1"         "Trim21"        "Rnf121"       
+# [540] "Dus3l"         "Eif2ak4"       "Acot6"         "Elf1"          "Dkkl1"         "Herc2"         "Tssk3"        
+# [547] "Tmed2"         "Itgb2"         "Ube2k"         "Ube2l6"        "Pcdhb1"        "Dtymk"         "Slc16a6"      
+# [554] "Ccl3"          "Pms2"          "Gfap"          "Cep164"        "Slc8a3"        "Macrod2"       "Vmn1r54"      
+# [561] "Ms4a6c"        "Zic3"          "St6gal1"       "Iqce"          "Gldc"          "Elovl6"        "Spag6"        
+# [568] "Cntn2"         "Lcn2"          "Ccdc34"        "Ccdc120"       "Tmem243"       "Aanat"         "Themis2"      
+# [575] "Rnf26"         "Kif3b"         "Serinc3"       "Lcp1"          "Sema5b"        "Gpr50"         "Dnal4"        
+# [582] "Ctss"          "Lbr"           "Ptprc"         "Slamf8"        "Tada1"         "Snw1"          "Cxcl13"       
+# [589] "Cmas"          "Serping1"      "Cysrt1"        "H2-Eb1"        "Zbtb38"        "Pbx3"          "Dok4"         
+# [596] "Cfb"           "Paqr5"         "Cxcl11"        "Fat3"          "Ifngr1"        "Prss40"        "Atad2b"       
+# [603] "Trim25"        "Ptgs2"         "Syngr2"        "Acvrl1"        "Lysmd1"        "Ephb3"         "Tlr2"         
+# [610] "Mboat7"        "Mfsd1"         "Cmtm7"         "Slc39a13"      "Helz2"         "Ehbp1"         "Cabp4"        
+# [617] "Fhl1"          "Gon4l"         "Gzmk"          "Oas1c"         "Acp5"          "Gdpd2"         "Sh3bgrl"      
+# [624] "0610012G03Rik" "Cd14"          "Pycrl"         "Prr9"          "Cd48"          "Il17rb"        "Mast2"        
+# [631] "Sdc4"          "Cby1"          "Aif1l"         "Casp12"        "Rcor2"         "Il6"           "Srgn"         
+# [638] "Rcbtb1"        "Spsb4"         "Vkorc1"        "Leprotl1"      "Cd3g"          "Anapc5"        "Slc29a3"      
+# [645] "Ahi1"          "Hmg20a"        "Vwa5a"         "Dram1"         "Abcb4"         "Itgax"         "Ccdc113"      
+# [652] "Ppp1r1a"       "Pomgnt1"       "Fancg"         "Zfp704"        "Hmgb3"         "1700017B05Rik" "Foxn4"        
+# [659] "Pml"           "Arl2"          "Grem2"         "Aldh7a1"       "Mark1"         "Tmed9"         "Uxt"          
+# [666] "Uaca"          "Abhd13"        "Atp4a"         "Clec2d"        "Slc2a5"        "Agbl5"         "Lpin1"        
+# [673] "Myh8"          "Pik3ap1"       "Rbmx"          "Myo19"         "Lman1l"        "Ikbkg"         "Slfn5"        
+# [680] "Cd86"          "Tmem140"       "Dtx3"          "Mest"          "Plscr2"        "Tank"          "Nmur2"        
+# [687] "Ccl4"          "Ube2e3"        "Ints1"         "Smarca1"       "Ska2"          "Gypc"          "Dse"          
+# [694] "Ifi27l2a"      "Trim13"        "Npdc1"         "Cntfr"         "Dcbld1"        "Pitpnc1"       "Slc16a7"      
+# [701] "Cyp2b13"       "Synpo"         "Nfkbie"        "Rlbp1"         "Slfn1"         "Fkbp6"         "Pipox"        
+# [708] "Ncf1"          "Nek4"          "Prpf4b"        "Plek2"         "Mcfd2"         "Erp44"         "Usp25"        
+# [715] "Prrx1"         "A230006K03Rik" "Dlx1"          "Slc29a4"       "Clec1a"        "H2-M3"         "Aif1"         
+# [722] "Arf6"          "Wnt7b"         "Stat2"         "Gpr182"        "Tshz1"         "Arrb2"         "Fkbp15"       
+# [729] "Samhd1"        "C3ar1"         "Gstz1"         "Cux1"          "Memo1"         "Ankle2"        "Zmym1"        
+# [736] "C1qb"          "Hmbox1"        "Vsx2"          "Tnfsf13b"      "Cdk2ap1"       "Prrc2a"        "Huwe1"        
+# [743] "Serpinb9"      "Acot7"         "Naglu"         "Mmp15"         "Pnp"           "Dnase1l2"      "Il15"         
+# [750] "Cd44"          "Uvrag"         "Arhgef5"       "Lhpp"          "B3gnt2"        "Bcas2"         "Rnf216"       
+# [757] "Rasl12"        "Best1"         "Casp8"         "Slc31a1"       "Rnf220"        "L3hypdh"       "Ap2s1"        
+# [764] "Ccl8"          "Rsph9"         "Abcc1"         "Serf1"         "Cytip"         "Vcam1"         "Cxcl16"       
+# [771] "Slamf7"        "Plxna1"        "Hypk"          "Eml5"          "Kcnq2"         "Kcnmb2"        "Shisa2"       
+# [778] "Ankrd24"       "Nfxl1"         "Lgals3"        "B3gat1"        "Adam19"        "Dmtn"          "Acaca"        
+# [785] "Mx2"           "Rwdd2b"        "Mgat4b"        "Sh3d19"        "Lrrc23"        "Hdac1"         "C1qc"         
+# [792] "Hp1bp3"        "Clec4a3"       "Limch1"        "Mprip"         "Htr5a"         "Sox5"          "Anxa3"        
+# [799] "Rpp25"         "Enpp4"         "Sgsh"          "S100a8"        "Maged1"        "Il1a"          "Lair1"        
+# [806] "Dmpk"          "Serpine1"      "Mtch1"         "Gprin1"        "Rbm47"         "Dapp1"         "Dhx58"        
+# [813] "Ampd2"         "Oas3"          "Tapbp"         "Col26a1"       "Timp1"         "Rhbg"          "Ralgapa2"     
+# [820] "Serpina3n"     "Zfp36"         "H2-Ke6"        "Accsl"         "Ctsz"          "Cd302"         "Tgm2"         
+# [827] "Psmb10"        "Nmi"           "Zfp608"        "Dalrd3"        "Ctr9"          "Vrk2"          "Ikbke"        
+# [834] "Ctc1"          "Msn"           "Efnb2"         "Tfap2a"        "Cd53"          "Peli1"         "Ncapd2"       
+# [841] "Adcy8"         "Ipo9"          "Spats2"        "Shc1"          "Grn"           "B3gnt9"        "Kifc3"        
+# [848] "Tlr3"          "Pten"          "Ring1"         "Magi1"         "Clec16a"       "Fbxo16"        "Ttc8"         
+# [855] "Hic2"          "Il17d"         "Sbno1"         "Khdrbs3"       "Rab3b"         "Arhgap4"       "Fcna"         
+# [862] "Dr1"           "Iqgap2"        "Il7"           "Spns1"
+
+#Correlation matrix with top genes in all 8 datasets
+sum(metaOutputFDR[,7]<0.05 & metaOutputFDR[,6]>7, na.rm=TRUE)
+# [1] 490
+
+TopGenesInAll8Datasets<-row.names(metaOutputFDR)[metaOutputFDR[,7]<0.05 & metaOutputFDR[,6]>7 & is.na(metaOutputFDR[,6])==FALSE]
+# [1] "1700017B05Rik" "3110040N11Rik" "A230006K03Rik" "Aanat"         "Abcc1"         "Acaca"         "Acer1"        
+# [8] "Acot6"         "Acp5"          "Acvrl1"        "Adam17"        "Adcy4"         "Aif1"          "Akr1cl"       
+# [15] "Akt1"          "Angpt1"        "Anln"          "Anxa3"         "Ap3b2"         "Apobec1"       "Arf6"         
+# [22] "Arhgap4"       "Arhgef40"      "Arhgef5"       "Arl10"         "Arrb2"         "Art3"          "Atp10a"       
+# [29] "Atp4a"         "Atp7b"         "AW112010"      "B2m"           "B3gnt2"        "Basp1"         "Bcas2"        
+# [36] "Birc2"         "Bst2"          "Btk"           "C1qb"          "C1qc"          "C3"            "C3ar1"        
+# [43] "Cabp4"         "Cacna1h"       "Cap1"          "Casp1"         "Casp12"        "Casp4"         "Casp8"        
+# [50] "Cbwd1"         "Ccdc59"        "Ccl12"         "Ccl2"          "Ccl3"          "Ccl4"          "Ccl5"         
+# [57] "Ccl7"          "Ccl8"          "Cd14"          "Cd164"         "Cd274"         "Cd2ap"         "Cd300a"       
+# [64] "Cd302"         "Cd37"          "Cd3d"          "Cd3g"          "Cd44"          "Cd48"          "Cd52"         
+# [71] "Cd53"          "Cd72"          "Cd74"          "Cd86"          "Cdh23"         "Cela1"         "Cenpc1"       
+# [78] "Cfb"           "Ch25h"         "Chchd3"        "Chrac1"        "Chrnb1"        "Cib1"          "Clec14a"      
+# [85] "Clec16a"       "Clec2d"        "Clec5a"        "Clnk"          "Cmtm7"         "Cnot2"         "Cnot6"        
+# [92] "Cox15"         "Cpsf4"         "Csf2rb"        "Csf2rb2"       "Csnk1g1"       "Cst7"          "Ctsc"         
+# [99] "Ctss"          "Ctsz"          "Cul7"          "Cux1"          "Cxcl10"        "Cxcl11"        "Cxcl13"       
+# [106] "Cxcl16"        "Cxcl9"         "Cybb"          "Cyp2b13"       "Cyp2d26"       "Cytip"         "Dapp1"        
+# [113] "Ddx60"         "Dennd4c"       "Dgcr2"         "Dgcr8"         "Dhx58"         "Dlx1"          "Dnajc3"       
+# [120] "Dr1"           "Dram1"         "Dyrk1b"        "Eif2ak2"       "Eif2d"         "Eif4g3"        "Elf1"         
+# [127] "Emilin1"       "Eml5"          "Enpp4"         "Eomes"         "Epsti1"        "Erp44"         "Exoc4"        
+# [134] "Eya3"          "F9"            "Fcer1g"        "Fcgr1"         "Fcgr4"         "Fgl2"          "Fkbp15"       
+# [141] "Fkbp6"         "Fli1"          "Fmo1"          "Foxc1"         "Foxk2"         "Foxn4"         "Fryl"         
+# [148] "Ftsj1"         "Fyb"           "Gbe1"          "Gbf1"          "Gbp2"          "Gbp3"          "Gbp7"         
+# [155] "Gbp8"          "Gch1"          "Gfap"          "Gigyf1"        "Gimap4"        "Glis2"         "Gnas"         
+# [162] "Gpr182"        "Gpsm2"         "Grem2"         "Grn"           "Gstm6"         "Gsx1"          "Gypc"         
+# [169] "Gzma"          "Gzmb"          "Gzmk"          "H2-Aa"         "H2-Ab1"        "H2-Eb1"        "H2-K1"        
+# [176] "H2-M3"         "H2-Oa"         "H2-T24"        "H6pd"          "Hcls1"         "Hdac1"         "Hdlbp"        
+# [183] "Helz"          "Hk2"           "Hmbox1"        "Hmg20a"        "Hnrnpul2"      "Hp1bp3"        "Huwe1"        
+# [190] "Icam1"         "Ifi27l2a"      "Ifi35"         "Ifi44"         "Ifih1"         "Ifit1"         "Ifit2"        
+# [197] "Ifitm1"        "Ifitm3"        "Ifng"          "Ifngr1"        "Igf1"          "Iigp1"         "Ikbke"        
+# [204] "Ikbkg"         "Il15"          "Il17rd"        "Il18r1"        "Il1a"          "Il2rg"         "Il6"          
+# [211] "Il6st"         "Il7"           "Ins1"          "Ipo4"          "Ipo7"          "Iqgap2"        "Irak4"        
+# [218] "Irf1"          "Irf7"          "Irf8"          "Irf9"          "Irgm1"         "Isg20"         "Itga4"        
+# [225] "Itgam"         "Itgax"         "Itgb2"         "Kat2b"         "Katnb1"        "Kbtbd4"        "Khdrbs2"      
+# [232] "Kmo"           "Kras"          "Krt4"          "Lair1"         "Lbr"           "Lcn2"          "Lcp1"         
+# [239] "Leprotl1"      "Lgals3"        "Lgals3bp"      "Lgals7"        "Lgals9"        "Lhcgr"         "Lhx9"         
+# [246] "Limd1"         "Limk2"         "Lman1l"        "Lmx1b"         "Lrfn1"         "Lrg1"          "Lrp1"         
+# [253] "Ltb"           "Ly6a"          "Ly6h"          "Ly86"          "Lyz2"          "Magi1"         "Map3k8"       
+# [260] "Mbd2"          "Mbnl1"         "Mboat7"        "Mbtd1"         "Mcfd2"         "Med25"         "Memo1"        
+# [267] "Mfsd1"         "Mgp"           "Mob1a"         "Morn4"         "Mpeg1"         "Ms4a4b"        "Ms4a4c"       
+# [274] "Ms4a4d"        "Ms4a6b"        "Ms4a6c"        "Ms4a6d"        "Msn"           "Mst1"          "Mst1r"        
+# [281] "Msx3"          "Mvk"           "Mx1"           "Mx2"           "Myh8"          "Myl1"          "Mylk"         
+# [288] "Nacc1"         "Naglu"         "Ncf1"          "Ncf4"          "Ncoa6"         "Nf1"           "Nfe2l2"       
+# [295] "Nfkbie"        "Nfxl1"         "Ngdn"          "Nin"           "Nkg7"          "Nmi"           "Nos3"         
+# [302] "Nphp1"         "Nr1h2"         "Nsun4"         "Oas1a"         "Oas1c"         "Oas2"          "Oas3"         
+# [309] "Oasl1"         "Oasl2"         "Otor"          "Oxsr1"         "Pafah1b1"      "Pard3"         "Parp12"       
+# [316] "Parp14"        "Parp9"         "Pdcd1lg2"      "Peli1"         "Pias2"         "Pik3ap1"       "Pitpnc1"      
+# [323] "Pkmyt1"        "Pla2g4a"       "Plac8"         "Plce1"         "Pld2"          "Plek2"         "Plscr2"       
+# [330] "Pml"           "Pms2"          "Pnp"           "Pon3"          "Pou3f3"        "Pou3f4"        "Ppp2r2b"      
+# [337] "Prdx6"         "Prpf4b"        "Prrx1"         "Prss40"        "Prtn3"         "Psmb10"        "Psmb7"        
+# [344] "Psmb8"         "Psmb9"         "Psmc3"         "Pten"          "Ptger1"        "Ptger4"        "Ptgs2"        
+# [351] "Ptpn6"         "Ptprc"         "Pwp2"          "Rbm47"         "Rbmx"          "Rcbtb1"        "Rfc1"         
+# [358] "Rhbg"          "Rhoa"          "Rin2"          "Rnf115"        "Rnf121"        "Rnf220"        "Rnf26"        
+# [365] "Rpl39l"        "Rps6kb1"       "Rsad2"         "Rtp4"          "Rufy1"         "Ryr1"          "S100a3"       
+# [372] "S100a8"        "Sag"           "Samhd1"        "Samsn1"        "Sbno1"         "Scaf11"        "Scara5"       
+# [379] "Sclt1"         "Sdad1"         "Sdc4"          "Sema3f"        "Sema5b"        "Serinc3"       "Serpina3n"    
+# [386] "Serpinb8"      "Serpinb9"      "Serpine1"      "Serping1"      "Setdb1"        "Sftpa1"        "Sgk3"         
+# [393] "Sh3bgrl"       "Sh3pxd2a"      "Shc1"          "Slamf7"        "Slamf8"        "Slc12a4"       "Slc15a3"      
+# [400] "Slc16a6"       "Slc22a29"      "Slc29a3"       "Slc31a1"       "Slc6a6"        "Slco1a6"       "Slfn1"        
+# [407] "Slfn2"         "Slfn4"         "Slfn8"         "Snw1"          "Socs3"         "Sox12"         "Sox14"        
+# [414] "Sox21"         "Sox5"          "Sox7"          "Sp100"         "Spag6"         "Spcs2"         "Sppl3"        
+# [421] "Sptlc1"        "Src"           "Srgn"          "Srp9"          "Stap1"         "Stat1"         "Stat2"        
+# [428] "Stc1"          "Sumf1"         "Syngr2"        "Synpo"         "Tank"          "Tap2"          "Tapbp"        
+# [435] "Tbk1"          "Tgfbi"         "Tgm2"          "Timp1"         "Tlr2"          "Tlr3"          "Tmed5"        
+# [442] "Tmed9"         "Tmem140"       "Tmem159"       "Tmem167"       "Tmem71"        "Tnfsf10"       "Tnfsf13b"     
+# [449] "Tor3a"         "Trim21"        "Trim25"        "Trim30a"       "Trim30d"       "Trnt1"         "Trrap"        
+# [456] "Trub2"         "Tspan10"       "Tspan4"        "Tspo"          "Tssk3"         "Ttl"           "Uap1l1"       
+# [463] "Ubd"           "Ube2k"         "Ube2l6"        "Ube2w"         "Ubxn8"         "Usp18"         "Usp25"        
+# [470] "Usp3"          "Usp43"         "Utp3"          "Uvrag"         "Uxt"           "Vangl1"        "Vcam1"        
+# [477] "Vmn1r54"       "Vmn1r58"       "Vps25"         "Vrk2"          "Vwa5a"         "Wipf1"         "Wiz"          
+# [484] "Wnt3a"         "Xdh"           "Yipf5"         "Zbp1"          "Zbtb20"        "Zfp358"        "Zfp36"
+
+cor(as.matrix(MetaAnalysis_FoldChanges[which(MetaAnalysis_FoldChanges$x%in%TopGenesInAll8Datasets),-1]), use="pairwise.complete.obs")
+#Export in Excel format
+write.csv(cor(as.matrix(MetaAnalysis_FoldChanges[which(MetaAnalysis_FoldChanges$x%in%TopGenesInAll8Datasets),-1]), use="pairwise.complete.obs"), "CorMatrix_WholeBrain_ViralInfection_Log2FC_Topgenes_Alldatasets.csv")
+#Plot heatmap for this correlation matrix
+heatmap.2(cor(as.matrix(MetaAnalysis_FoldChanges[which(MetaAnalysis_FoldChanges$x%in%TopGenesInAll8Datasets),-1]), use="pairwise.complete.obs"), cexRow = 0.8, cexCol = 0.75, margins = c(12,12), sepwidth = c(0.025, 0.025), trace ="none", key = TRUE, keysize = 1, key.title = "Color Key", density.info = "none")
+
+#Top genes in all 8 datasets ordered by P values
+TopGenesInAll8Datasets<-row.names(metaOutputFDR_OrderbyPval)[metaOutputFDR_OrderbyPval[,7]<0.05 & metaOutputFDR_OrderbyPval[,6]>7 & is.na(metaOutputFDR_OrderbyPval[,6])==FALSE]
+# [1] "Lhx9"          "Mbnl1"         "Ly6h"          "Gnas"          "Fryl"          "Gstm6"         "Ryr1"         
+# [8] "H2-Oa"         "Cap1"          "Serpinb8"      "Cox15"         "Ubxn8"         "Tmem71"        "Gsx1"         
+# [15] "Lrfn1"         "Gigyf1"        "Pld2"          "Chrac1"        "Btk"           "Med25"         "Ptger4"       
+# [22] "Slc22a29"      "Akt1"          "Kbtbd4"        "Basp1"         "Fli1"          "Sumf1"         "Exoc4"        
+# [29] "Pias2"         "Tmem159"       "Zfp358"        "Dnajc3"        "Vps25"         "Limk2"         "Gbp3"         
+# [36] "Ipo7"          "Art3"          "Emilin1"       "Srp9"          "Nf1"           "Pwp2"          "Adam17"       
+# [43] "Il6st"         "Ms4a4d"        "Tspan10"       "Cib1"          "Gbp2"          "Prdx6"         "Cacna1h"      
+# [50] "Gbp7"          "Cd164"         "Uap1l1"        "Usp43"         "Stap1"         "Cxcl10"        "Irgm1"        
+# [57] "Krt4"          "Ccl5"          "Rin2"          "Kat2b"         "Atp10a"        "Sox14"         "Cd52"         
+# [64] "Bst2"          "Iigp1"         "Pou3f3"        "Xdh"           "Plac8"         "AW112010"      "F9"           
+# [71] "Ifit1"         "Chrnb1"        "Oxsr1"         "Tspan4"        "Ccl12"         "Cela1"         "Psmb9"        
+# [78] "Usp18"         "Stat1"         "Ftsj1"         "Ube2w"         "Isg20"         "Dennd4c"       "Psmc3"        
+# [85] "Ins1"          "Rsad2"         "Trim30a"       "Myl1"          "Anln"          "Irak4"         "Nkg7"         
+# [92] "Mbtd1"         "Cd274"         "Oasl2"         "Stc1"          "Khdrbs2"       "Hk2"           "Gzmb"         
+# [99] "Arhgef40"      "Ms4a4b"        "Setdb1"        "Clec14a"       "Ifitm3"        "Kmo"           "Sox21"        
+# [106] "Tbk1"          "Ch25h"         "Fgl2"          "Ltb"           "Ly86"          "Sftpa1"        "Oas1a"        
+# [113] "Ms4a4c"        "Lgals7"        "Ccdc59"        "Fcgr4"         "Cxcl9"         "Mylk"          "Gbe1"         
+# [120] "Cbwd1"         "Vmn1r58"       "Ncf4"          "Pou3f4"        "Sema3f"        "Dyrk1b"        "H2-Aa"        
+# [127] "Lgals3bp"      "B2m"           "Rnf115"        "Ifih1"         "Otor"          "Eomes"         "Mob1a"        
+# [134] "Pafah1b1"      "Gzma"          "Slfn4"         "Igf1"          "Parp9"         "Epsti1"        "Sh3pxd2a"     
+# [141] "Clec5a"        "Sag"           "Src"           "Ifi44"         "Oasl1"         "Kras"          "Trrap"        
+# [148] "Nsun4"         "Ncoa6"         "Cnot6"         "Gimap4"        "Zbp1"          "Vangl1"        "H2-T24"       
+# [155] "Cybb"          "Sgk3"          "Icam1"         "Rfc1"          "H6pd"          "Samsn1"        "Ap3b2"        
+# [162] "Oas2"          "Csf2rb"        "Trim30d"       "Clnk"          "Itga4"         "Dgcr8"         "Tmem167"      
+# [169] "Scara5"        "Sppl3"         "Adcy4"         "Fyb"           "Ifit2"         "Mx1"           "Gbp8"         
+# [176] "Ngdn"          "Gbf1"          "Rtp4"          "Trnt1"         "H2-K1"         "Ly6a"          "Parp14"       
+# [183] "Il2rg"         "Cdh23"         "Ttl"           "Slfn8"         "Ifi35"         "Il18r1"        "Map3k8"       
+# [190] "Mst1"          "Irf1"          "Gpsm2"         "Ms4a6b"        "Sdad1"         "Pdcd1lg2"      "Pla2g4a"      
+# [197] "Lgals9"        "Foxc1"         "Hnrnpul2"      "Pard3"         "Sp100"         "Cenpc1"        "Psmb8"        
+# [204] "Birc2"         "Glis2"         "Sptlc1"        "Cd74"          "Sox7"          "Cd3d"          "Irf7"         
+# [211] "Irf8"          "Ddx60"         "Eif4g3"        "Prtn3"         "Slc15a3"       "Cst7"          "Cyp2d26"      
+# [218] "Itgam"         "Eif2ak2"       "Nin"           "Mgp"           "Katnb1"        "Parp12"        "3110040N11Rik"
+# [225] "Cd37"          "Cd300a"        "Tnfsf10"       "Ptpn6"         "Ptger1"        "Hcls1"         "Socs3"        
+# [232] "Ppp2r2b"       "Wiz"           "Tgfbi"         "Cd72"          "Scaf11"        "Sclt1"         "Lyz2"         
+# [239] "Irf9"          "Dgcr2"         "H2-Ab1"        "Lrg1"          "Mbd2"          "Apobec1"       "Fcgr1"        
+# [246] "Fmo1"          "Arl10"         "Nphp1"         "C3"            "Ccl2"          "Angpt1"        "Tmed5"        
+# [253] "Tap2"          "Lrp1"          "Fcer1g"        "Ccl7"          "Il17rd"        "Hdlbp"         "Ms4a6d"       
+# [260] "Rhoa"          "Ubd"           "Cd2ap"         "Limd1"         "Ifitm1"        "Mpeg1"         "Nr1h2"        
+# [267] "Gch1"          "Utp3"          "Csnk1g1"       "Csf2rb2"       "Sox12"         "Tspo"          "S100a3"       
+# [274] "Cul7"          "Wipf1"         "Mvk"           "Ctsc"          "Nos3"          "Tor3a"         "Helz"         
+# [281] "Slfn2"         "Zbtb20"        "Nfe2l2"        "Slc6a6"        "Yipf5"         "Casp4"         "Slc12a4"      
+# [288] "Morn4"         "Ifng"          "Pon3"          "Usp3"          "Plce1"         "Casp1"         "Trim21"       
+# [295] "Rnf121"        "Acot6"         "Elf1"          "Tssk3"         "Itgb2"         "Ube2k"         "Ube2l6"       
+# [302] "Slc16a6"       "Ccl3"          "Pms2"          "Gfap"          "Vmn1r54"       "Ms4a6c"        "Spag6"        
+# [309] "Lcn2"          "Wnt3a"         "Aanat"         "Rnf26"         "Serinc3"       "Lcp1"          "Sema5b"       
+# [316] "Foxk2"         "Ctss"          "Lbr"           "Ptprc"         "Slamf8"        "Snw1"          "Cxcl13"       
+# [323] "Akr1cl"        "Serping1"      "H2-Eb1"        "Cfb"           "Cxcl11"        "Ifngr1"        "Prss40"       
+# [330] "Trim25"        "Ptgs2"         "Syngr2"        "Acvrl1"        "Tlr2"          "Mboat7"        "Mfsd1"        
+# [337] "Cmtm7"         "Cabp4"         "Trub2"         "Gzmk"          "Oas1c"         "Acp5"          "Sh3bgrl"      
+# [344] "Cd14"          "Cd48"          "Sdc4"          "Casp12"        "Il6"           "Srgn"          "Rcbtb1"       
+# [351] "Mst1r"         "Leprotl1"      "Cd3g"          "Slc29a3"       "Hmg20a"        "Vwa5a"         "Rps6kb1"      
+# [358] "Dram1"         "Itgax"         "1700017B05Rik" "Foxn4"         "Pml"           "Spcs2"         "Grem2"        
+# [365] "Tmed9"         "Uxt"           "Atp4a"         "Clec2d"        "Myh8"          "Pik3ap1"       "Rbmx"         
+# [372] "Lman1l"        "Ikbkg"         "Cd86"          "Tmem140"       "Plscr2"        "Tank"          "Ccl4"         
+# [379] "Gypc"          "Ifi27l2a"      "Psmb7"         "Pitpnc1"       "Cyp2b13"       "Synpo"         "Nfkbie"       
+# [386] "Cpsf4"         "Slfn1"         "Fkbp6"         "Ncf1"          "Prpf4b"        "Eya3"          "Plek2"        
+# [393] "Mcfd2"         "Erp44"         "Usp25"         "Prrx1"         "A230006K03Rik" "Dlx1"          "Rufy1"        
+# [400] "H2-M3"         "Aif1"          "Arf6"          "Rpl39l"        "Chchd3"        "Stat2"         "Gpr182"       
+# [407] "Arrb2"         "Fkbp15"        "Samhd1"        "C3ar1"         "Cux1"          "Memo1"         "C1qb"         
+# [414] "Hmbox1"        "Tnfsf13b"      "Huwe1"         "Serpinb9"      "Naglu"         "Acer1"         "Pnp"          
+# [421] "Il15"          "Cd44"          "Pkmyt1"        "Uvrag"         "Arhgef5"       "Atp7b"         "B3gnt2"       
+# [428] "Bcas2"         "Slco1a6"       "Casp8"         "Slc31a1"       "Rnf220"        "Ccl8"          "Lhcgr"        
+# [435] "Abcc1"         "Cytip"         "Vcam1"         "Cxcl16"        "Slamf7"        "Lmx1b"         "Eml5"         
+# [442] "Nfxl1"         "Lgals3"        "Eif2d"         "Acaca"         "Mx2"           "Hdac1"         "C1qc"         
+# [449] "Hp1bp3"        "Sox5"          "Anxa3"         "Enpp4"         "S100a8"        "Il1a"          "Lair1"        
+# [456] "Serpine1"      "Rbm47"         "Dapp1"         "Dhx58"         "Oas3"          "Tapbp"         "Timp1"        
+# [463] "Rhbg"          "Serpina3n"     "Zfp36"         "Ctsz"          "Cd302"         "Tgm2"          "Psmb10"       
+# [470] "Nmi"           "Msx3"          "Vrk2"          "Cnot2"         "Ikbke"         "Msn"           "Cd53"         
+# [477] "Peli1"         "Shc1"          "Grn"           "Tlr3"          "Pten"          "Magi1"         "Clec16a"      
+# [484] "Nacc1"         "Ipo4"          "Sbno1"         "Arhgap4"       "Dr1"           "Iqgap2"        "Il7"  
+
+#Create forest plots for these genes
+MakeForestPlots("Cap1")
+MakeForestPlots("Serpinb8")
+MakeForestPlots("Cox15")
+MakeForestPlots("Ubxn8")
+MakeForestPlots("Tmem71")
+MakeForestPlots("Gsx1")
+MakeForestPlots("Lrfn1")
+MakeForestPlots("Gigyf1")
+MakeForestPlots("Pld2")
+MakeForestPlots("Chrac1")
+MakeForestPlots("Btk")
+MakeForestPlots("Med25")
+MakeForestPlots("Ptger4")
+MakeForestPlots("Slc22a29")
+MakeForestPlots("Akt1")
+MakeForestPlots("Kbtbd4")
+MakeForestPlots("Basp1")
+
+
